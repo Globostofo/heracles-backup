@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Backs up the data and secrets of the Heracles host into a restic repository.
+# Runs on the backup machine and pulls everything over SSH: the host never gets
+# access to the backups.
+set -euo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+config=${HERACLES_BACKUP_CONFIG:-$here/backup.conf}
+tag=heracles-backup
+
+usage() {
+	cat <<EOF
+Usage: ${0##*/} COMMAND
+
+Commands:
+  init               create the restic repository (and its password file if missing)
+  run                back up the host, forget old snapshots, check the repository
+  restore DIR [ID]   restore a snapshot (default: latest) into DIR
+  restic ARGS...     run restic on the repository (snapshots, ls, diff, mount...)
+
+Configuration: $config (see backup.conf.example).
+EOF
+}
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+log() {
+	echo "==> $*" >&2
+}
+
+load_config() {
+	[[ -r $config ]] || die "config not found: $config (start from backup.conf.example)"
+	# shellcheck source=backup.conf.example
+	source "$config"
+	: "${SSH_HOST:?missing in config}" "${RESTIC_REPOSITORY:?missing in config}"
+	: "${RESTIC_PASSWORD_FILE:?missing in config}" "${DEPLOY_ROOT:?missing in config}"
+	SOURCE_NAME=${SOURCE_NAME:-$SSH_HOST}
+	HELPER_IMAGE=${HELPER_IMAGE:-debian:bookworm-slim}
+	KEEP_LAST=${KEEP_LAST:-10}
+	[[ -v SSH_COMMAND ]] || SSH_COMMAND=(ssh)
+	[[ -v POSTGRES ]] || POSTGRES=()
+	[[ -v VOLUMES ]] || VOLUMES=()
+	[[ -v HOST_PATHS ]] || HOST_PATHS=()
+	[[ -v PROJECTS ]] || PROJECTS=()
+	[[ -v EXCLUDES ]] || EXCLUDES=()
+	[[ -v PAUSE ]] || PAUSE=()
+	export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+	command -v restic >/dev/null || die "restic is not installed"
+}
+
+# Local repositories live on a removable disk: say so instead of letting restic fail.
+check_repository_reachable() {
+	if [[ $RESTIC_REPOSITORY == /* && ! -d $(dirname "$RESTIC_REPOSITORY") ]]; then
+		die "$(dirname "$RESTIC_REPOSITORY") does not exist: is the backup disk mounted?"
+	fi
+}
+
+cmd_init() {
+	check_repository_reachable
+	if [[ ! -e $RESTIC_PASSWORD_FILE ]]; then
+		log "creating the password file $RESTIC_PASSWORD_FILE"
+		mkdir -p "$(dirname "$RESTIC_PASSWORD_FILE")"
+		(umask 077 && head -c 32 /dev/urandom | base64 >"$RESTIC_PASSWORD_FILE")
+		log "store a copy of this password outside this machine: without it the backups cannot be read"
+	fi
+	restic init
+}
+
+# Runs one command of remote.sh on the host; its output goes to stdout.
+remote() {
+	"${SSH_COMMAND[@]}" "${ssh_options[@]}" "$SSH_HOST" "bash -s -- $(printf '%q ' "$@")" <"$here/remote.sh"
+}
+
+# Saves the output of one remote command to a file; an empty dump means a failure.
+fetch() {
+	local output=$1
+	shift
+	remote "$@" >"$output"
+	[[ -s $output ]] || die "empty output for: $*"
+}
+
+cleanup() {
+	"${SSH_COMMAND[@]}" "${ssh_options[@]}" -O exit "$SSH_HOST" >/dev/null 2>&1 || true
+	rm -rf "$work"
+}
+
+cmd_run() {
+	check_repository_reachable
+	restic cat config >/dev/null || die "cannot open the restic repository (run init first?)"
+
+	# Staged in RAM: the dumps hold every secret of the host, they never touch a disk unencrypted.
+	work=${XDG_RUNTIME_DIR:-/dev/shm}/$tag
+	rm -rf "$work"
+	(umask 077 && mkdir -p "$work"/ssh "$work"/data/{postgres,volumes,paths})
+	ssh_options=(-o ControlMaster=auto -o "ControlPath=$work/ssh/%C" -o ControlPersist=60)
+	trap cleanup EXIT
+
+	log "connecting to $SSH_HOST"
+	"${SSH_COMMAND[@]}" "${ssh_options[@]}" -o ConnectTimeout=10 "$SSH_HOST" true ||
+		die "cannot reach $SSH_HOST (is the VPN connected?)"
+
+	local item name
+	for item in "${POSTGRES[@]}"; do
+		log "postgres: $item"
+		fetch "$work/data/postgres/$item.sql" postgres "$item"
+	done
+	for item in "${VOLUMES[@]}"; do
+		log "volume: $item"
+		fetch "$work/data/volumes/$item.tar" volume "$item" "$HELPER_IMAGE"
+	done
+	for item in "${HOST_PATHS[@]}"; do
+		log "path: $item"
+		name=${item#/}
+		fetch "$work/data/paths/${name//\//_}.tar" path "$item" "$HELPER_IMAGE"
+	done
+	if ((${#PROJECTS[@]})); then
+		log "deployment files: ${PROJECTS[*]}"
+		local args=()
+		for item in "${PAUSE[@]}"; do args+=(--pause "$item"); done
+		for item in "${EXCLUDES[@]}"; do args+=(--exclude "$item"); done
+		fetch "$work/data/deployment.tar" files "$DEPLOY_ROOT" "$HELPER_IMAGE" "${args[@]}" "${PROJECTS[@]}"
+	fi
+
+	log "saving the snapshot"
+	restic backup --host "$SOURCE_NAME" --tag "$tag" "$work/data"
+	log "forgetting old snapshots (keeping the last $KEEP_LAST)"
+	restic forget --host "$SOURCE_NAME" --tag "$tag" --keep-last "$KEEP_LAST" --prune
+	log "checking the repository"
+	restic check
+}
+
+cmd_restore() {
+	local target=${1:?usage: restore DIR [ID]} snapshot=${2:-latest}
+	check_repository_reachable
+	restic restore "$snapshot" --host "$SOURCE_NAME" --tag "$tag" --target "$target"
+	log "restored into $target (files keep their original path, under .../$tag/data)"
+}
+
+main() {
+	local command=${1:-}
+	shift || true
+	case $command in
+	init) load_config && cmd_init ;;
+	run) load_config && cmd_run ;;
+	restore) load_config && cmd_restore "$@" ;;
+	restic) load_config && restic "$@" ;;
+	-h | --help | help) usage ;;
+	*) usage >&2 && exit 1 ;;
+	esac
+}
+
+ssh_options=()
+work=
+main "$@"

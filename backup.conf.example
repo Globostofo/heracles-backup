@@ -1,0 +1,35 @@
+# shellcheck shell=bash disable=SC2034 # read by heracles-backup
+# heracles-backup configuration, sourced by bash.
+# Copy it to backup.conf (git-ignored) and adapt it to your host.
+
+# SSH destination of the host (user@address, or an alias from ~/.ssh/config).
+SSH_HOST=user@host.example
+# Name recorded in the snapshots (defaults to SSH_HOST).
+SOURCE_NAME=heracles
+
+# restic repository, and the file holding its password (created by `heracles-backup init`).
+RESTIC_REPOSITORY=/mnt/backup/heracles
+RESTIC_PASSWORD_FILE=$HOME/.config/heracles-backup/password
+
+# Containers running the official postgres image: plain SQL dump of POSTGRES_DB.
+POSTGRES=(heracles-auth-postgresql-1)
+# Docker named volumes, archived whole.
+VOLUMES=()
+# Host paths outside the deployments; root-owned files are fine.
+HOST_PATHS=(/etc/openvpn/server)
+
+# Directory holding the deployed repositories, relative to the remote home.
+DEPLOY_ROOT=deployment
+# Deployments to scan, relative to DEPLOY_ROOT. From a git repository, only the files
+# git does not track are kept (.env, overrides, keys, data directories); a directory
+# that is not a git repository is kept whole.
+PROJECTS=(heracles/heracles-proxy heracles/heracles-auth heracles/heracles-portal)
+# Paths under DEPLOY_ROOT to leave out, such as build outputs.
+EXCLUDES=()
+# Containers paused while the deployment files are archived (SQLite databases...).
+PAUSE=()
+
+# Image used on the host to read volumes and root-owned files (needs GNU tar).
+HELPER_IMAGE=debian:bookworm-slim
+# Snapshots kept after each run.
+KEEP_LAST=10

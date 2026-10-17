@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stands in for ssh in the tests: runs the remote command locally, from FAKE_HOME.
+set -euo pipefail
+for arg; do [[ $arg == -O ]] && exit 0; done
+cd "$FAKE_HOME"
+HOME=$FAKE_HOME exec bash -c "${*: -1}"
